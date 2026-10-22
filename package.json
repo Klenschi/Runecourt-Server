@@ -1,0 +1,16 @@
+{
+  "name": "runecourt-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Runecourt Spielserver: Konten, Warteschlange, Lobbys mit Code, Kämpfe auf dem Server",
+  "type": "module",
+  "license": "GPL-2.0-or-later",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "rules": "node tools/extract-rules.mjs",
+    "start": "node src/index.js",
+    "bots": "node bot/bot.js ws://localhost:8080 6",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": { "ws": "^8.18.0" }
+}
