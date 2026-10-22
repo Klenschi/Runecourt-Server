@@ -4,12 +4,14 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { Store } from './store.js';
+import { Cloud } from './cloud.js';
 import { Game, rankOf } from './game.js';
 
 const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const today = (d = 0) => new Date(Date.now() + d * 864e5).toISOString().slice(0, 10);
 const cleanName = s => String(s || '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 20);
 
-export function startServer(opts = {}) {
+export async function startServer(opts = {}) {
   const cfg = {
     port: opts.port ?? 8080,
     dataDir: opts.dataDir ?? './data',
@@ -20,10 +22,12 @@ export function startServer(opts = {}) {
     minHumans: opts.minHumans ?? 2,
     allowOrigin: opts.allowOrigin ?? '*'
   };
-  const store = new Store(cfg.dataDir);
+  const store = new Store(cfg.dataDir, opts.cloud ?? new Cloud(process.env.RC_SAVE_EMAIL, process.env.RC_SAVE_PASSWORD));
+  const saved = await store.init(); console.log('Spielstände:', saved);
   const clients = new Map();   // accountId -> {ws, account}
   const games = new Set();
   const inGame = new Map();    // accountId -> Game
+  const watching = new Map();  // accountId -> Game (nur Zuschauer)
   const lobbies = new Map();   // code -> {code, host, members:[accountId]}
   let queue = [];              // accountIds
   let queueTimer = null;
@@ -36,6 +40,7 @@ export function startServer(opts = {}) {
     const seats = ids.map(id => ({ account: store.get(id), send: sender(id) }));
     const g = new Game({ seats, ranked, timers, code, onEnd: (game, results) => {
       games.delete(game);
+      for (const [w, g] of watching) if (g === game) watching.delete(w);
       for (const id of ids) if (inGame.get(id) === game) inGame.delete(id);
       if (results) for (const r of results) if (r.accountId) store.result(r.accountId, r.place, r.rpDelta);
     } });
@@ -71,8 +76,9 @@ export function startServer(opts = {}) {
       const { account, token } = store.login(m.token, cleanName(m.name));
       const old = clients.get(account.id); if (old && old.ws !== ws) try { old.ws.close(4000, 'anderswo angemeldet'); } catch {}
       state.id = account.id; clients.set(account.id, { ws, account });
-      send(ws, { t: 'welcome', id: account.id, token, name: account.name, rp: account.rp, rank: rankOf(account.rp) });
-      const g = inGame.get(account.id); if (g && !g.over) g.rejoin(account.id, sender(account.id));
+      const g = inGame.get(account.id), back = !!(g && !g.over);
+      send(ws, { t: 'welcome', id: account.id, token, name: account.name, rp: account.rp, rank: rankOf(account.rp), inGame: back });
+      if (back) g.rejoin(account.id, sender(account.id));
       return;
     }
     if (!state.id) return send(ws, { t: 'error', msg: 'Erst anmelden (hello).' });
@@ -90,6 +96,22 @@ export function startServer(opts = {}) {
         lobbies.delete(l.code); startGame(l.members, false, l.code); return; }
       case 'act': { const g = inGame.get(id); if (!g) return send(ws, { t: 'error', msg: 'Keine laufende Partie.' });
         const err = g.act(id, m); if (err) send(ws, { t: 'error', msg: err }); return; }
+      case 'say': { // feste Zurufe, kein freier Text; höchstens einer alle 2 Sekunden
+        const i = Math.floor(+m.i); if (!(i >= 0 && i < 8)) return;
+        if (Date.now() - (state.said || 0) < 2000) return; state.said = Date.now();
+        const g = inGame.get(id) || watching.get(id); if (g && !g.over) g.say(id, i, store.get(id)?.name);
+        return; }
+      case 'watch': { const g = inGame.get(id) || watching.get(id); if (!g) return send(ws, { t: 'error', msg: 'Keine laufende Partie.' });
+        const err = g.watch(id, sender(id), store.get(id)?.name, m.seat); if (err) return send(ws, { t: 'error', msg: err });
+        if (!inGame.has(id)) watching.set(id, g); return; }
+      case 'spectate': { const code = String(m.code || '').toUpperCase();
+        const g = [...games].find(x => x.code === code && !x.over);
+        if (!g) return send(ws, { t: 'error', msg: lobbies.has(code) ? 'Die Partie hat noch nicht begonnen.' : 'Unter diesem Code läuft gerade keine Partie.' });
+        if (inGame.has(id)) return send(ws, { t: 'error', msg: 'Du bist schon in einer Partie.' });
+        leaveLobby(id); queue = queue.filter(x => x !== id);
+        const err = g.watch(id, sender(id), store.get(id)?.name, m.seat); if (err) return send(ws, { t: 'error', msg: err });
+        watching.set(id, g); return; }
+      case 'unwatch': { watching.get(id)?.unwatch(id); watching.delete(id); return; }
       case 'me': { const a = store.get(id); return send(ws, { t: 'me', name: a.name, rp: a.rp, rank: rankOf(a.rp), games: a.games, wins: a.wins }); }
       default: return send(ws, { t: 'error', msg: 'Unbekannte Nachricht.' });
     }
@@ -99,6 +121,24 @@ export function startServer(opts = {}) {
     const h = { 'Access-Control-Allow-Origin': cfg.allowOrigin, 'Content-Type': 'application/json; charset=utf-8' };
     if (req.url === '/health') { res.writeHead(200, h); return res.end(JSON.stringify({ ok: true, games: games.size, online: clients.size, queue: queue.length })); }
     if (req.url === '/leaderboard') { res.writeHead(200, h); return res.end(JSON.stringify(store.leaderboard().map(r => ({ ...r, tier: rankOf(r.rp) })))); }
+    // Tägliche Herausforderung: Ergebnis melden und Tagesrangliste
+    const dm = /^\/daily(?:\?date=(\d{4}-\d{2}-\d{2}))?$/.exec(req.url);
+    if (dm && req.method === 'GET') { res.writeHead(200, h); return res.end(JSON.stringify(store.dailyBoard(dm[1] || today()).slice(0, 50))); }
+    if (req.url === '/daily' && req.method === 'OPTIONS') { res.writeHead(204, { ...h, 'Access-Control-Allow-Methods': 'POST, GET', 'Access-Control-Allow-Headers': 'content-type' }); return res.end(); }
+    if (req.url === '/daily' && req.method === 'POST') {
+      let body = '';
+      req.on('data', c => { body += c; if (body.length > 2000) req.destroy(); });
+      req.on('end', () => {
+        let m; try { m = JSON.parse(body); } catch { res.writeHead(400, h); return res.end('{"error":"json"}'); }
+        const ok = [today(), today(-1)].includes(m.date);
+        const place = Math.round(+m.place), round = Math.round(+m.round), hp = Math.round(+m.hp);
+        if (!ok || !(place >= 1 && place <= 6) || !(round >= 1 && round <= 60) || !(hp >= -99 && hp <= 99)) { res.writeHead(400, h); return res.end('{"error":"werte"}'); }
+        const { account, token } = store.login(m.token, cleanName(m.name));
+        const r = store.daily(m.date, account, { place, round, hp, hueter: String(m.hueter || '').slice(0, 20) });
+        res.writeHead(200, h); res.end(JSON.stringify({ token, name: account.name, ...r }));
+      });
+      return;
+    }
     res.writeHead(404, h); res.end('{"error":"not found"}');
   });
   const wss = new WebSocketServer({ server, maxPayload: 8 * 1024 });
@@ -116,10 +156,11 @@ export function startServer(opts = {}) {
       const id = state.id; if (!id || clients.get(id)?.ws !== ws) return;
       clients.delete(id); queue = queue.filter(x => x !== id); leaveLobby(id);
       inGame.get(id)?.leave(id);
+      watching.get(id)?.unwatch(id); watching.delete(id);
     });
   });
   return new Promise(resolve => server.listen(cfg.port, () => {
     const port = server.address().port;
-    resolve({ port, store, games, close: () => new Promise(r => { clearTimeout(queueTimer); for (const g of games) { g.over = true; clearTimeout(g.timer); } wss.clients.forEach(c => c.terminate()); wss.close(); server.close(() => { store.flush(); r(); }); }) });
+    resolve({ port, store, games, close: () => new Promise(r => { clearTimeout(queueTimer); for (const g of games) { g.over = true; clearTimeout(g.timer); clearTimeout(g.abandon); } wss.clients.forEach(c => c.terminate()); wss.close(); server.close(() => { store.close().then(r, r); }); }) });
   }));
 }

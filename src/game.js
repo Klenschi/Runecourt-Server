@@ -26,6 +26,7 @@ export class Game {
       this.S.players.push(p);
     }
     this.over = false; this.timer = null;
+    this.watchers = new Map(); // accountId -> {send, seat, name}
     this.startPick();
   }
   get players() { return this.S.players; }
@@ -72,7 +73,7 @@ export class Game {
       if (!p.alive) continue;
       p.tmpA = 0; p.tmpH = 0; p.ready = p.bot;
       p.gold = Math.min(10, 2 + S.round);
-      if (S.round > 1 && p.level < R.MAX_LEVEL) p.lvlCost = Math.max(0, p.lvlCost - 1);
+      if (!R.autoRise(p) && S.round > 1 && p.level < R.MAX_LEVEL) p.lvlCost = Math.max(0, p.lvlCost - 1);
       p.free = p.bonusFree || 0; if (p.hueter === 'hexe') p.gold++; p.bonusFree = 0;
       if (p.bonusGold) { p.gold += p.bonusGold; p.bonusGold = 0; }
       if (S.omen === 'goldregen' && S.round <= 3) p.gold++;
@@ -169,8 +170,10 @@ export class Game {
     const fights = pairs.map(([a, b]) => ({ a, b, r: R.simulate(a, b, S.day) }));
     for (const f of fights) R.applyResult(f.a, f.b, f.r);
     for (const f of fights) for (const [me, opp, meIsA] of [[f.a, f.b, true], [f.b, f.a, false]]) {
-      if (me.ghost || !me.send) continue;
-      this.sendTo(me, { t: 'fight', round: S.round, day: S.day, opp: this.pub(opp), meIsA, ev: f.r.ev, winner: f.r.winner, dmg: f.r.dmg });
+      if (me.ghost) continue;
+      const msg = { t: 'fight', round: S.round, day: S.day, opp: this.pub(opp), meIsA, ev: f.r.ev, winner: f.r.winner, dmg: f.r.dmg };
+      if (me.send) this.sendTo(me, msg);
+      for (const w of this.watchers.values()) if (w.seat === me.seat) this.sendTo(w, msg);
     }
     // Ausgeschiedene und Plätze, wie im Spiel im Browser
     const living = this.players.filter(p => p.alive);
@@ -179,6 +182,7 @@ export class Game {
     const left = this.players.filter(p => p.alive);
     if (left.length <= 1) { if (left[0]) left[0].place = 1; return this.finish(); }
     for (const p of out) this.sendTo(p, { t: 'eliminated', place: p.place });
+    for (const w of this.watchers.values()) if (!this.players[w.seat].alive) w.seat = this.watchSeat();
     S.round++;
     this.timer = setTimeout(() => this.startRound(), this.timers.fightMs);
   }
@@ -187,6 +191,8 @@ export class Game {
     const places = this.players.map(p => ({ seat: p.seat, name: p.name, hueter: p.hueter, place: p.place || 1, bot: p.bot, accountId: p.accountId }));
     const results = places.map(x => ({ ...x, rpDelta: this.ranked && !x.bot ? RP_DELTA[x.place - 1] : 0 }));
     for (const p of this.humans()) this.sendTo(p, { t: 'gameOver', place: p.place || 1, ranked: this.ranked, results: results.map(({ accountId, ...r }) => r) });
+    for (const [id, w] of this.watchers) if (!this.player(id)) this.sendTo(w, { t: 'watchEnd', results: results.map(({ accountId, ...r }) => r) });
+    this.watchers.clear();
     this.onEnd?.(this, results);
   }
 
@@ -205,12 +211,58 @@ export class Game {
   }
   sendTo(p, msg) { try { p.send?.(msg); } catch {} }
   sendState(p) { if (p.send) this.sendTo(p, this.view(p)); }
-  broadcastState() { for (const p of this.humans()) this.sendState(p); }
+  broadcastState() {
+    for (const p of this.humans()) if (!this.watchers.has(p.accountId)) this.sendState(p);
+    for (const w of this.watchers.values()) this.sendTo(w, { ...this.view(this.players[w.seat]), watch: true });
+  }
+  // ---------- Zuschauen ----------
+  watchSeat(prefer) {
+    const alive = this.players.filter(p => p.alive);
+    if (prefer != null && alive.some(p => p.seat === prefer)) return prefer;
+    return (alive.find(p => !p.bot) || alive[0] || this.players[0]).seat;
+  }
+  // Ausgeschiedene Spieler und Freunde mit dem Lobby-Code können einem lebenden Spieler zusehen
+  watch(accountId, send, name, seat) {
+    if (this.over) return 'Die Partie ist schon vorbei.';
+    const p = this.player(accountId);
+    if (p && p.alive) return 'Du spielst noch mit.';
+    const w = this.watchers.get(accountId) || { name };
+    w.send = send; w.seat = this.watchSeat(seat == null ? null : Number(seat));
+    const fresh = !this.watchers.has(accountId); this.watchers.set(accountId, w);
+    if (fresh) this.sendTo(w, { t: 'watchStart', code: this.code, seats: this.players.map(x => this.pub(x)) });
+    this.sendTo(w, { ...this.view(this.players[w.seat]), watch: true });
+    return null;
+  }
+  unwatch(accountId) { this.watchers.delete(accountId); }
+  // ---------- Zurufe ----------
+  say(accountId, i, name) {
+    const p = this.player(accountId), w = this.watchers.get(accountId);
+    if (!p && !w) return;
+    const msg = { t: 'said', i, name: p ? p.name : name, seat: p ? p.seat : null, watcher: !p };
+    for (const h of this.humans()) if (h.send) this.sendTo(h, msg);
+    for (const [id, x] of this.watchers) if (!this.player(id)) this.sendTo(x, msg);
+  }
   // Verbindung weg: der Platz spielt als Computer weiter
   leave(accountId) {
     const p = this.player(accountId); if (!p) return;
     p.send = null;
-    if (this.humans().every(h => !h.send) && !this.over) { this.over = true; clearTimeout(this.timer); this.onEnd?.(this, null); }
+    // Alle Menschen weg: kurz warten, vielleicht lädt nur jemand die Seite neu
+    if (this.humans().every(h => !h.send) && !this.over) {
+      clearTimeout(this.abandon);
+      this.abandon = setTimeout(() => {
+        if (this.over || this.humans().some(h => h.send)) return;
+        this.over = true; clearTimeout(this.timer); this.onEnd?.(this, null);
+      }, this.timers.abandonMs ?? 90000);
+    }
   }
-  rejoin(accountId, send) { const p = this.player(accountId); if (!p) return false; p.send = send; this.sendState(p); return true; }
+  // Zurück in die laufende Partie, auch nach dem Neuladen der Seite
+  rejoin(accountId, send) {
+    const p = this.player(accountId); if (!p) return false;
+    p.send = send; clearTimeout(this.abandon);
+    this.sendTo(p, { t: 'matchStart', ranked: this.ranked, code: this.code, resume: true, seats: this.players.map(x => this.pub(x)) });
+    if (!p.alive) { this.sendTo(p, { t: 'eliminated', place: p.place }); return true; }
+    this.sendState(p);
+    if (this.S.phase === 'pick' && !p.picked) this.sendTo(p, { t: 'pick', options: p.options, ms: Math.max(0, this.deadline - Date.now()), omen: this.S.omen });
+    return true;
+  }
 }

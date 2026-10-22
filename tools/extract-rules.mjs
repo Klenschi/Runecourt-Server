@@ -12,7 +12,7 @@ const read = f => fs.readFileSync(path.join(SRC, f), 'utf8');
 
 // Reihenfolge wie im Browser-Build (build.py), aber ohne Oberfläche (view, title, motion, sound, net, scout)
 let data = read('data.js');
-const cre = read('creatures.js') + '\n' + read('creatures2.js') + '\nconst C=Object.fromEntries(CREATURES.map(c=>[c.id,c]));\n';
+const cre = read('creatures.js') + '\n' + read('creatures2.js') + '\n' + read('creatures3.js') + '\nconst C=Object.fromEntries(CREATURES.map(c=>[c.id,c]));\n';
 if (!data.includes('/*CREATURES*/')) throw new Error('data.js: Platzhalter /*CREATURES*/ fehlt');
 data = data.replace('/*IMG*/{}', '{}').replace('/*CREATURES*/', () => cre);
 const parts = [
@@ -22,7 +22,8 @@ const parts = [
   ['logic.js', read('logic.js')],
   ['spells.js', read('spells.js')],
   ['ai.js', read('ai.js')],
-  ['depth.js', read('depth.js')]
+  ['depth.js', read('depth.js')],
+  ['moor.js', read('moor.js')]
 ];
 
 // Oberflächen-Funktionen, die die Regeln aufrufen, werden zu leeren Hüllen
@@ -42,7 +43,7 @@ globalThis.RULES = {
   get S(){return S}, set S(v){S=v},
   get UID(){return UID}, set UID(v){UID=v},
   C, CREATURES, HUETER, SIPPEN, MAX_LEVEL, LEVEL_COST, POOL_SIZE, OMENS, SPELLS, WARDEN_HP,
-  newPlayer, rollShop, costOf, onBuy, checkMerge, allUnits, firstFree, aiTurn, eulenhexen,
+  newPlayer, autoRise, autoLevel, rollShop, costOf, onBuy, checkMerge, allUnits, firstFree, aiTurn, eulenhexen,
   simulate, applyResult, mkUnit, wardenHp, usePower, powerState, powerPossible, aiPower,
   applySpell, spellCost, rollSpell, omenDay, rewardTier, aiReward, poolLeft, poolOut, unitPower,
   shuffle, pick, setLang: typeof setLang==='function'?setLang:()=>{}

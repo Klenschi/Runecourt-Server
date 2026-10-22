@@ -36,6 +36,8 @@ Einstellungen über Umgebungsvariablen:
 | --- | --- | --- |
 | `PORT` | Port des Servers | 8080 |
 | `DATA_DIR` | Ordner für die Konten-Datei | ./data |
+| `RC_SAVE_EMAIL` | E-Mail eines eigenen Firebase-Kontos für den Server (wird beim ersten Start angelegt). Damit überleben Konten, Rangliste und Tagesrangliste jeden Neustart. | leer = nur lokal |
+| `RC_SAVE_PASSWORD` | Passwort dazu (mindestens 6 Zeichen, nirgends sonst benutzen) | leer |
 | `PICK_MS`, `MARKET_MS`, `FIGHT_MS` | Zeiten für Hüter-Wahl, Markt, Kampf-Anschauen (Millisekunden) | 20000, 45000, 9000 |
 | `QUEUE_FILL_MS` | Wartezeit, bis Computer-Gegner auffüllen | 30000 |
 | `MIN_HUMANS` | Menschen, die für eine Partie mit Rangpunkten nötig sind | 2 |
